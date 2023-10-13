@@ -1,18 +1,20 @@
 package uk.sky.brownbags.mediacodec
 
-import android.content.res.AssetFileDescriptor
+import android.content.res.AssetManager
 import android.media.MediaCodec
 import android.media.MediaCodecList
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Bundle
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import java.io.BufferedReader
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.nio.ByteBuffer
 
-class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
 
-    private lateinit var renderer: Renderer
+class SamplesPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,7 +31,9 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        renderer = Renderer(holder.surface, assets.openFd(TEST_ASSET))
+        renderer = Renderer(
+            holder.surface,
+            resources.assets.open("frames.jc4", AssetManager.ACCESS_STREAMING))
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -40,7 +44,7 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
     }
 
     private companion object {
-        private const val TEST_ASSET = "sample2.mp4"
+        private lateinit var renderer: Renderer
 
         val hexChars = "0123456789abcdef".toCharArray()
         fun ByteArray.toHex4(): String {
@@ -53,14 +57,16 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
 
             return hex.joinToString("")
         }
+
+        fun String.toByteArray(): ByteArray = chunked(2)
+            .map { it.toInt(16).toByte() }
+            .toByteArray()
     }
 
     private class Renderer(
         private val surface: Surface,
-        private val asset: AssetFileDescriptor
+        private val frames: InputStream
     ) : Thread() {
-
-        private lateinit var extractor: MediaExtractor
 
         private var running = false
         private var duration = -1L
@@ -70,9 +76,11 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
         }
 
         override fun run() {
-            extractor = MediaExtractor()
-            extractor.setDataSource(asset)
-            createFormatAndDecoder { format, decoder ->
+            val lines = BufferedReader(InputStreamReader(frames)).readLines()
+
+            var sample = 1
+
+            createFormatAndDecoder(lines[0]) { format, decoder ->
                 maybeReportDurationChanged(format)
 
                 // Configure decoder
@@ -89,19 +97,20 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
                     if (inputIndex >= 0) {
                         val buffer = decoder.getInputBuffer(inputIndex)
                         if (buffer != null) {
-                            val sampleSize = extractor.readSampleData(buffer, 0)
-                            if (sampleSize < 0) {
+                            if (sample >= lines.size) {
                                 // End of stream
                                 decoder.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             } else {
-                                val mediaPresentationTime = extractor.sampleTime
+                                val line = lines[sample]
+                                val data = line.split(":")[1].trim().split(" ")
 
-                                val arr = ByteArray(size = buffer.limit())
-                                buffer.get(arr)
-                                println("jrc $mediaPresentationTime ${arr.toHex4()}")
+                                val mediaPresentationTime = data[0].trim().toLong()
 
-                                decoder.queueInputBuffer(inputIndex, 0, sampleSize, mediaPresentationTime, 0)
-                                extractor.advance()
+                                val frame = data[1].trim().replaceNalStartUnit().toByteArray()
+                                buffer.put(frame)
+
+                                decoder.queueInputBuffer(inputIndex, 0, frame.size, mediaPresentationTime, 0)
+                                sample++
                             }
                         }
                     }
@@ -114,8 +123,10 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
                     val info = MediaCodec.BufferInfo()
                     val outputIndex = decoder.dequeueOutputBuffer(info, 0)
                     when (outputIndex) {
-                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {}
-                        MediaCodec.INFO_TRY_AGAIN_LATER -> {}
+                        MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        }
+                        MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        }
                         else -> {
                             while (info.presentationTimeUs > ((System.nanoTime() - startTime) / 1_000L)) {
                                 sleep(1L)
@@ -140,35 +151,52 @@ class BasicPlayerActivity : InmersiveActivity(), SurfaceHolder.Callback {
                 decoder.stop()
                 decoder.release()
             }
-            extractor.release()
-            asset.close()
         }
 
-        private fun createFormatAndDecoder(callback: (MediaFormat, MediaCodec) -> Unit) {
-            for (i in 0 until extractor.trackCount) {
-                // Get the format for the track
-                val format: MediaFormat = extractor.getTrackFormat(i)
-                if (format.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                    // Select the track
-                    extractor.selectTrack(i)
+        private fun createFormatAndDecoder(info: String, callback: (MediaFormat, MediaCodec) -> Unit) {
+            val data = info.split(":")[1].trim().split(",")
+            val mediaFormat = MediaFormat()
+            mediaFormat.setInteger("max-bitrate", data[0].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_TRACK_ID, data[1].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_LEVEL, data[2].toInt())
+            mediaFormat.setString(MediaFormat.KEY_MIME, data[3])
+            mediaFormat.setInteger(MediaFormat.KEY_PROFILE, data[4].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, data[5].toInt())
+            mediaFormat.setString(MediaFormat.KEY_LANGUAGE, data[6])
+            mediaFormat.setInteger("display-width", data[7].toInt())
+            mediaFormat.setInteger("display-height", data[8].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_WIDTH, data[9].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_HEIGHT, data[10].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, data[11].toInt())
+            mediaFormat.setInteger(MediaFormat.KEY_FRAME_RATE, data[12].toInt())
+            mediaFormat.setLong(MediaFormat.KEY_DURATION, data[13].toLong())
+            mediaFormat.setByteBuffer("csd-0", ByteBuffer.wrap(data[14].toByteArray()))
+            mediaFormat.setByteBuffer("csd-1",ByteBuffer.wrap(data[15].toByteArray()))
 
-                    println("jrc $format")
+            val codecName = MediaCodecList(
+                MediaCodecList.REGULAR_CODECS
+            ).findDecoderForFormat(mediaFormat)
+            val decoder = MediaCodec.createByCodecName(codecName)
 
-                    // Create a decoder for the format
-                    val codecName = MediaCodecList(
-                        MediaCodecList.REGULAR_CODECS
-                    ).findDecoderForFormat(format)
-                    val decoder = MediaCodec.createByCodecName(codecName)
-
-                    callback(format, decoder)
-                }
-            }
+            callback(mediaFormat, decoder)
         }
 
         private fun maybeReportDurationChanged(mediaFormat: MediaFormat) {
             if (mediaFormat.containsKey(MediaFormat.KEY_DURATION)) {
                 duration = mediaFormat.getLong(MediaFormat.KEY_DURATION)
             }
+        }
+
+        private fun String.replaceNalStartUnit(): String {
+            var frame = this
+            var idx = 0
+            while (idx < frame.length) {
+                val length = frame.substring(idx, idx + 8).toInt(16)
+                frame = frame.replaceRange(idx, idx + 8, "00000001")
+                idx += (length * 2) + 8
+                println("jrc $frame")
+            }
+            return frame
         }
     }
 }
